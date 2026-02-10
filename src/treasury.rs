@@ -1,5 +1,4 @@
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -11,6 +10,7 @@ use crate::state::{AppState, GoldEntry};
 struct PusherMessage {
     event: Option<String>,
     data: Option<serde_json::Value>,
+    #[allow(dead_code)]
     channel: Option<String>,
 }
 
@@ -115,7 +115,7 @@ pub async fn treasury_ws_loop(state: Arc<AppState>) {
                 });
 
                 if let Err(e) = write
-                    .send(Message::Text(subscribe_msg.to_string()))
+                    .send(Message::Text(subscribe_msg.to_string().into()))
                     .await
                 {
                     tracing::error!("Failed to subscribe: {}", e);
@@ -127,22 +127,23 @@ pub async fn treasury_ws_loop(state: Arc<AppState>) {
                 while let Some(msg_result) = read.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
-                            match serde_json::from_str::<PusherMessage>(&text) {
+                            let text_str: &str = &text;
+                            match serde_json::from_str::<PusherMessage>(text_str) {
                                 Ok(pusher_msg) => {
                                     let event = pusher_msg.event.as_deref().unwrap_or("");
 
                                     match event {
                                         e if e == TREASURY_EVENT => {
                                             if let Some(data_val) = pusher_msg.data {
-                                                let gold_data: Option<GoldRateData> = match data_val
-                                                {
-                                                    serde_json::Value::String(s) => {
-                                                        serde_json::from_str(&s).ok()
-                                                    }
-                                                    other => {
-                                                        serde_json::from_value(other).ok()
-                                                    }
-                                                };
+                                                let gold_data: Option<GoldRateData> =
+                                                    match data_val {
+                                                        serde_json::Value::String(s) => {
+                                                            serde_json::from_str(&s).ok()
+                                                        }
+                                                        other => {
+                                                            serde_json::from_value(other).ok()
+                                                        }
+                                                    };
 
                                                 if let Some(gd) = gold_data {
                                                     process_treasury_data(&state, gd).await;
@@ -156,7 +157,10 @@ pub async fn treasury_ws_loop(state: Arc<AppState>) {
                                             tracing::info!("Subscription succeeded");
                                         }
                                         "pusher:error" => {
-                                            tracing::warn!("Pusher error: {:?}", pusher_msg.data);
+                                            tracing::warn!(
+                                                "Pusher error: {:?}",
+                                                pusher_msg.data
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -184,7 +188,7 @@ pub async fn treasury_ws_loop(state: Arc<AppState>) {
             Err(e) => {
                 consecutive_errors += 1;
                 tracing::error!(
-                    "Treasury WebSocket connect error (attempt {}): {}",
+                    "Treasury WS connect error (attempt {}): {}",
                     consecutive_errors,
                     e
                 );
@@ -192,7 +196,7 @@ pub async fn treasury_ws_loop(state: Arc<AppState>) {
         }
 
         let wait = std::cmp::min(consecutive_errors as u64, 15);
-        tracing::info!("Reconnecting Treasury WebSocket in {}s...", wait);
+        tracing::info!("Reconnecting Treasury WS in {}s...", wait);
         tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
     }
 }
