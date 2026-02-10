@@ -3,12 +3,11 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::{any, get},
     Router,
 };
-use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,7 +23,6 @@ pub struct LimitQuery {
     key: Option<String>,
 }
 
-/// Extract client IP from headers (sama logic dengan security.rs)
 fn ip_from_headers(headers: &HeaderMap) -> String {
     if let Some(forwarded) = headers.get("x-forwarded-for") {
         if let Ok(val) = forwarded.to_str() {
@@ -47,9 +45,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/api/state", get(get_state))
         .route("/ws", get(ws_handler))
-        .route("/aturTS", get(atur_ts_no_value))
-        .route("/aturTS/", get(atur_ts_no_value))
-        .route("/aturTS/{value}", get(set_limit))
+        .route("/aturTS/:value", get(set_limit))
         .fallback(any(catch_all))
 }
 
@@ -109,7 +105,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!("WebSocket lagged by {} messages", n);
+                    tracing::debug!("WS lagged {}", n);
                     continue;
                 }
                 Err(_) => break,
@@ -144,18 +140,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     state.ws_manager.unsubscribe();
 }
 
-async fn atur_ts_no_value(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    let client_ip = ip_from_headers(&headers);
-    if state.is_ip_blocked(&client_ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
-    }
-    state.record_failed_attempt(&client_ip, 1);
-    (StatusCode::BAD_REQUEST, "Parameter tidak lengkap").into_response()
-}
-
 async fn set_limit(
     State(state): State<Arc<AppState>>,
     Path(value): Path<String>,
@@ -164,11 +148,12 @@ async fn set_limit(
 ) -> Response {
     let client_ip = ip_from_headers(&headers);
 
+    tracing::info!("set_limit called: value={}, ip={}", value, client_ip);
+
     if state.is_ip_blocked(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
-    // Validasi key
     let key = match query.key {
         Some(k) if !k.is_empty() => k,
         _ => {
@@ -177,10 +162,8 @@ async fn set_limit(
         }
     };
 
-    // Constant-time comparison
     let key_bytes = key.as_bytes();
     let secret_bytes = SECRET_KEY.as_bytes();
-
     let is_valid = if key_bytes.len() == secret_bytes.len() {
         key_bytes.ct_eq(secret_bytes).unwrap_u8() == 1
     } else {
@@ -192,7 +175,6 @@ async fn set_limit(
         return (StatusCode::FORBIDDEN, "Akses ditolak - key salah").into_response();
     }
 
-    // Parse value
     let int_value: i64 = match value.parse() {
         Ok(v) => v,
         Err(_) => {
@@ -201,18 +183,12 @@ async fn set_limit(
         }
     };
 
-    // Rate limit
     let now = utils::current_timestamp();
     let last = state.last_successful_call.load(Ordering::Relaxed);
     if now - last < RATE_LIMIT_SECONDS {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Terlalu cepat, tunggu beberapa detik",
-        )
-            .into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, "Terlalu cepat").into_response();
     }
 
-    // Range check
     if int_value < MIN_LIMIT || int_value > MAX_LIMIT {
         return (
             StatusCode::BAD_REQUEST,
@@ -221,7 +197,6 @@ async fn set_limit(
             .into_response();
     }
 
-    // Apply changes
     state.limit_bulan.store(int_value, Ordering::Relaxed);
     state.last_successful_call.store(now, Ordering::Relaxed);
 
@@ -229,29 +204,32 @@ async fn set_limit(
     let cached = state.get_cached_state();
     state.ws_manager.broadcast(cached);
 
-    tracing::info!("Limit bulan updated to {} by {}", int_value, client_ip);
+    tracing::info!("Limit updated to {} by {}", int_value, client_ip);
 
-    let resp = serde_json::json!({
-        "status": "ok",
-        "limit_bulan": int_value
-    });
-
-    (StatusCode::OK, axum::Json(resp)).into_response()
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "ok",
+            "limit_bulan": int_value
+        })),
+    )
+        .into_response()
 }
 
 async fn catch_all(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    req: axum::extract::Request,
+    uri: Uri,
 ) -> Response {
     let client_ip = ip_from_headers(&headers);
-    let path = req.uri().path().to_lowercase();
+    let path = uri.path().to_lowercase();
+
+    tracing::warn!("catch_all hit: path={}, ip={}", path, client_ip);
 
     if state.is_ip_blocked(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
-    // Skip aturTS variants - sudah di-handle route dedicated
     if !path.starts_with("/aturt") {
         if path.contains("admin") || path.contains("config") {
             state.record_failed_attempt(&client_ip, 2);
