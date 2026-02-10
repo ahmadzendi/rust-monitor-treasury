@@ -70,7 +70,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     let (mut sender, mut receiver) = socket.split();
 
-    // Send initial state
     let initial = state.get_cached_state();
     if sender
         .send(Message::Binary(initial.to_vec().into()))
@@ -153,23 +152,31 @@ async fn set_limit(
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
+    // Validasi key harus ada
     let key = match query.key {
-        Some(k) => k,
-        None => {
+        Some(k) if !k.is_empty() => k,
+        _ => {
             state.record_failed_attempt(&client_ip, 2);
             return (StatusCode::BAD_REQUEST, "Parameter key diperlukan").into_response();
         }
     };
 
+    // Constant-time comparison
     let key_bytes = key.as_bytes();
     let secret_bytes = SECRET_KEY.as_bytes();
-    if key_bytes.len() != secret_bytes.len()
-        || key_bytes.ct_eq(secret_bytes).unwrap_u8() != 1
-    {
+
+    let is_valid = if key_bytes.len() == secret_bytes.len() {
+        key_bytes.ct_eq(secret_bytes).unwrap_u8() == 1
+    } else {
+        false
+    };
+
+    if !is_valid {
         state.record_failed_attempt(&client_ip, 1);
-        return (StatusCode::FORBIDDEN, "Akses ditolak").into_response();
+        return (StatusCode::FORBIDDEN, "Akses ditolak - key salah").into_response();
     }
 
+    // Parse value
     let int_value: i64 = match value.parse() {
         Ok(v) => v,
         Err(_) => {
@@ -178,12 +185,18 @@ async fn set_limit(
         }
     };
 
+    // Rate limit per successful call
     let now = utils::current_timestamp();
     let last = state.last_successful_call.load(Ordering::Relaxed);
     if now - last < RATE_LIMIT_SECONDS {
-        return (StatusCode::TOO_MANY_REQUESTS, "Terlalu cepat").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Terlalu cepat, tunggu beberapa detik",
+        )
+            .into_response();
     }
 
+    // Range check
     if int_value < MIN_LIMIT || int_value > MAX_LIMIT {
         return (
             StatusCode::BAD_REQUEST,
@@ -192,12 +205,15 @@ async fn set_limit(
             .into_response();
     }
 
+    // Apply
     state.limit_bulan.store(int_value, Ordering::Relaxed);
     state.last_successful_call.store(now, Ordering::Relaxed);
 
     state.invalidate_cache();
     let cached = state.get_cached_state();
     state.ws_manager.broadcast(cached);
+
+    tracing::info!("Limit bulan updated to {} by {}", int_value, client_ip);
 
     let resp = serde_json::json!({
         "status": "ok",
@@ -218,9 +234,19 @@ async fn catch_all(
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
-    if path.contains("atur") || path.contains("admin") || path.contains("config") {
-        state.record_failed_attempt(&client_ip, 2);
-        return (StatusCode::FORBIDDEN, "Akses ditolak").into_response();
+    // PENTING: Jangan block path yang mengandung "atur" karena
+    // /aturTS sudah di-handle oleh route dedicated di atas.
+    // Kalau masuk catch_all dengan "atur", artinya path-nya
+    // bukan /aturTS yang valid (misal /atur-lain, /aturXYZ)
+    // Tapi kita harus exclude /aturTS variants yang mungkin
+    // masuk sini karena case sensitivity
+
+    // Hanya block jika BUKAN varian aturts
+    if !path.starts_with("/aturt") {
+        if path.contains("admin") || path.contains("config") {
+            state.record_failed_attempt(&client_ip, 2);
+            return (StatusCode::FORBIDDEN, "Akses ditolak").into_response();
+        }
     }
 
     state.record_failed_attempt(&client_ip, 1);
