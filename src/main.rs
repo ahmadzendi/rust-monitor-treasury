@@ -12,13 +12,7 @@ mod usd_idr;
 mod utils;
 mod ws_manager;
 
-use axum::{
-    Router,
-    middleware as axum_middleware,
-    extract::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{middleware as axum_middleware, Router};
 use std::sync::Arc;
 use tokio::signal;
 use tower_http::compression::CompressionLayer;
@@ -28,17 +22,17 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    // Set default ke INFO supaya bisa lihat log routing
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn")),
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .compact()
         .init();
 
     let state = Arc::new(AppState::new());
 
-    // Spawn background tasks
     let treasury_state = state.clone();
     tokio::spawn(async move {
         treasury::treasury_ws_loop(treasury_state).await;
@@ -71,6 +65,15 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Server starting on {}", addr);
 
+    // Log semua routes yang terdaftar
+    tracing::info!("Routes registered:");
+    tracing::info!("  GET /");
+    tracing::info!("  GET /health");
+    tracing::info!("  GET /api/state");
+    tracing::info!("  GET /ws");
+    tracing::info!("  GET /aturTS/:value?key=xxx");
+    tracing::info!("  * fallback -> catch_all");
+
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
     axum::serve(listener, app)
@@ -81,7 +84,9 @@ async fn main() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
