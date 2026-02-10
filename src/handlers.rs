@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{any, get},
     Router,
@@ -15,7 +15,6 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::config::*;
-use crate::security::get_client_ip;
 use crate::state::AppState;
 use crate::template::HTML_TEMPLATE;
 use crate::utils;
@@ -23,6 +22,23 @@ use crate::utils;
 #[derive(serde::Deserialize)]
 pub struct LimitQuery {
     key: Option<String>,
+}
+
+/// Extract client IP from headers (sama logic dengan security.rs)
+fn ip_from_headers(headers: &HeaderMap) -> String {
+    if let Some(forwarded) = headers.get("x-forwarded-for") {
+        if let Ok(val) = forwarded.to_str() {
+            if let Some(first) = val.split(',').next() {
+                return first.trim().to_string();
+            }
+        }
+    }
+    if let Some(real_ip) = headers.get("x-real-ip") {
+        if let Ok(val) = real_ip.to_str() {
+            return val.trim().to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -130,9 +146,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
 async fn atur_ts_no_value(
     State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
+    headers: HeaderMap,
 ) -> Response {
-    let client_ip = get_client_ip(&req);
+    let client_ip = ip_from_headers(&headers);
     if state.is_ip_blocked(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
@@ -144,15 +160,15 @@ async fn set_limit(
     State(state): State<Arc<AppState>>,
     Path(value): Path<String>,
     Query(query): Query<LimitQuery>,
-    req: axum::extract::Request,
+    headers: HeaderMap,
 ) -> Response {
-    let client_ip = get_client_ip(&req);
+    let client_ip = ip_from_headers(&headers);
 
     if state.is_ip_blocked(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
-    // Validasi key harus ada
+    // Validasi key
     let key = match query.key {
         Some(k) if !k.is_empty() => k,
         _ => {
@@ -185,7 +201,7 @@ async fn set_limit(
         }
     };
 
-    // Rate limit per successful call
+    // Rate limit
     let now = utils::current_timestamp();
     let last = state.last_successful_call.load(Ordering::Relaxed);
     if now - last < RATE_LIMIT_SECONDS {
@@ -205,7 +221,7 @@ async fn set_limit(
             .into_response();
     }
 
-    // Apply
+    // Apply changes
     state.limit_bulan.store(int_value, Ordering::Relaxed);
     state.last_successful_call.store(now, Ordering::Relaxed);
 
@@ -225,23 +241,17 @@ async fn set_limit(
 
 async fn catch_all(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     req: axum::extract::Request,
 ) -> Response {
-    let client_ip = get_client_ip(&req);
+    let client_ip = ip_from_headers(&headers);
     let path = req.uri().path().to_lowercase();
 
     if state.is_ip_blocked(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "IP diblokir sementara").into_response();
     }
 
-    // PENTING: Jangan block path yang mengandung "atur" karena
-    // /aturTS sudah di-handle oleh route dedicated di atas.
-    // Kalau masuk catch_all dengan "atur", artinya path-nya
-    // bukan /aturTS yang valid (misal /atur-lain, /aturXYZ)
-    // Tapi kita harus exclude /aturTS variants yang mungkin
-    // masuk sini karena case sensitivity
-
-    // Hanya block jika BUKAN varian aturts
+    // Skip aturTS variants - sudah di-handle route dedicated
     if !path.starts_with("/aturt") {
         if path.contains("admin") || path.contains("config") {
             state.record_failed_attempt(&client_ip, 2);
