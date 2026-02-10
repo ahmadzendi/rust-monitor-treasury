@@ -5,7 +5,7 @@ use axum::{
     },
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
     Router,
 };
 use bytes::Bytes;
@@ -34,7 +34,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/aturTS", get(atur_ts_no_value))
         .route("/aturTS/", get(atur_ts_no_value))
         .route("/aturTS/{value}", get(set_limit))
-        .fallback(get(catch_all).post(catch_all).put(catch_all).delete(catch_all).patch(catch_all))
+        .fallback(any(catch_all))
 }
 
 async fn index() -> Html<&'static str> {
@@ -47,11 +47,11 @@ async fn health() -> &'static str {
 
 async fn get_state(State(state): State<Arc<AppState>>) -> Response {
     let data = state.get_cached_state();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/json")
-        .body(axum::body::Body::from(data))
-        .unwrap()
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        data,
+    )
         .into_response()
 }
 
@@ -72,7 +72,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     // Send initial state
     let initial = state.get_cached_state();
-    if sender.send(Message::Binary(initial.to_vec())).await.is_err() {
+    if sender
+        .send(Message::Binary(initial.to_vec().into()))
+        .await
+        .is_err()
+    {
         state.ws_manager.unsubscribe();
         return;
     }
@@ -81,7 +85,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         loop {
             match rx.recv().await {
                 Ok(data) => {
-                    if sender.send(Message::Binary(data.to_vec())).await.is_err() {
+                    if sender
+                        .send(Message::Binary(data.to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -102,23 +110,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             )
             .await
             {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    if text == "ping" {
-                        // Client ping - handled by broadcast
-                    }
-                }
-                Ok(Some(Ok(Message::Binary(data)))) => {
-                    if data == b"ping" {
-                        // Client ping
-                    }
-                }
+                Ok(Some(Ok(Message::Text(_)))) => {}
+                Ok(Some(Ok(Message::Binary(_)))) => {}
                 Ok(Some(Ok(Message::Close(_)))) => break,
                 Ok(Some(Err(_))) => break,
                 Ok(None) => break,
-                Err(_) => {
-                    // Timeout - connection might be dead
-                    break;
-                }
+                Err(_) => break,
                 _ => {}
             }
         }
@@ -164,7 +161,6 @@ async fn set_limit(
         }
     };
 
-    // Constant-time comparison
     let key_bytes = key.as_bytes();
     let secret_bytes = SECRET_KEY.as_bytes();
     if key_bytes.len() != secret_bytes.len()
@@ -200,8 +196,8 @@ async fn set_limit(
     state.last_successful_call.store(now, Ordering::Relaxed);
 
     state.invalidate_cache();
-    let data = state.get_cached_state();
-    state.ws_manager.broadcast(data);
+    let cached = state.get_cached_state();
+    state.ws_manager.broadcast(cached);
 
     let resp = serde_json::json!({
         "status": "ok",
