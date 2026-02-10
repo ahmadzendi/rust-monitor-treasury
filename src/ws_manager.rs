@@ -1,14 +1,10 @@
-use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
-use futures_util::stream::SplitSink;
-use futures_util::SinkExt;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::config::*;
 use crate::state::AppState;
+use std::sync::Arc;
 
 pub struct WsManager {
     tx: broadcast::Sender<Bytes>,
