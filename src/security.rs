@@ -10,7 +10,6 @@ use std::sync::Arc;
 use crate::config::*;
 use crate::rate_limiter::RateLimitStatus;
 use crate::state::AppState;
-use crate::utils;
 
 const HTML_RATE_LIMITED: &str = r#"<!DOCTYPE html>
 <html><head><title>429 Too Many Requests</title></head>
@@ -31,14 +30,17 @@ pub fn get_client_ip(req: &Request) -> String {
         }
     }
 
-    req.extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    "unknown".to_string()
 }
 
 fn is_suspicious_path(path: &str) -> bool {
     let path_lower = path.to_lowercase();
+
+    // PENTING: Skip pengecekan untuk path /aturTS yang legitimate
+    if path_lower.starts_with("/aturt") {
+        return false;
+    }
+
     SUSPICIOUS_PATHS
         .iter()
         .any(|&sus| path_lower.contains(sus))
@@ -68,14 +70,18 @@ pub async fn security_middleware(
 ) -> impl IntoResponse {
     let client_ip = get_client_ip(&req);
     let path = req.uri().path().to_string();
+    let path_lower = path.to_lowercase();
 
-    // Check blocked
+    // Check blocked IP
     if state.is_ip_blocked(&client_ip) {
         return rate_limited_response();
     }
 
+    // Whitelist legitimate paths - skip rate limit untuk ini
+    let is_whitelisted = RATE_LIMIT_WHITELIST.iter().any(|&w| path == w)
+        || path_lower.starts_with("/aturt"); // /aturTS dan variannya
+
     // Rate limit (skip whitelist)
-    let is_whitelisted = RATE_LIMIT_WHITELIST.iter().any(|&w| path == w);
     if !is_whitelisted {
         let (allowed, _count, status) = state.rate_limiter.check(&client_ip);
 
@@ -91,24 +97,10 @@ pub async fn security_middleware(
         }
     }
 
-    // Suspicious path check
+    // Suspicious path check (aturTS sudah di-exclude di is_suspicious_path)
     if is_suspicious_path(&path) {
         state.record_failed_attempt(&client_ip, 3);
         return forbidden_response();
-    }
-
-    // Suspicious aturts patterns
-    let path_lower = path.to_lowercase();
-    if path_lower.starts_with("/aturts")
-        && path_lower != "/aturts"
-        && !path_lower.starts_with("/aturts/")
-    {
-        state.record_failed_attempt(&client_ip, 2);
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"error":"invalid"}"#))
-            .unwrap();
     }
 
     next.run(req).await.into_response()
